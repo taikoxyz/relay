@@ -357,8 +357,13 @@ impl Relay {
         let mock_from = Address::random();
 
         // Prepare futures for concurrent execution
+        // Fee payment is taken from the intent payer (feePayer) if set, otherwise from the EOA.
+        // Deficit checks must use the payer, not the EOA, or sponsored flows will always appear
+        // underfunded when the user has 0 ETH.
+        let fee_token_owner = intent.payer.unwrap_or(intent.eoa);
+
         let user_balance_fut = self.get_assets(GetAssetsParameters::for_asset_on_chain(
-            intent.eoa,
+            fee_token_owner,
             chain_id,
             context.fee_token,
         ));
@@ -576,7 +581,7 @@ impl Relay {
         let fee_token_spending = asset_diffs
             .0
             .iter()
-            .find(|(address, _)| *address == intent.eoa)
+            .find(|(address, _)| *address == fee_token_owner)
             .and_then(|(_, diffs)| {
                 diffs.iter().find(|diff| diff.address.unwrap_or_default() == context.fee_token)
             })
@@ -1128,14 +1133,35 @@ impl Relay {
             // check if delegation is needed
             let delegation_status = self.delegation_status(&fee_payer, request.chain_id).await?;
 
+            debug!(
+                chain_id = %request.chain_id,
+                fee_payer = %fee_payer,
+                delegation = ?delegation_status,
+                "fee payer delegation status"
+            );
+
             if let DelegationStatus::Stored { account, implementation } = delegation_status {
-                // check if the implementation is at least v0.5.6. before ithaca account v0.5.6, the
-                // contracts had a check which required all precalls to be signed by the eoa
-                if self.is_ithaca_account(implementation, semver::Version::new(0, 5, 6)) {
-                    // put the delegation as the first call
-                    pre_calls.insert(0, account.pre_call.clone());
-                    additional_authorization = Some((fee_payer, account.signed_authorization))
+                // The fee payer must be delegated (7702) for `Orchestrator._pay()` to work.
+                //
+                // When the fee payer is a stored EOA, we attach its stored authorization (so the
+                // intent tx can include it in its 7702 authorization list), and we prepend its
+                // initialization pre-call so the fee payer is usable immediately.
+                //
+                // Note: prior to IthacaAccount v0.5.6, contracts required all pre-calls to be
+                // signed by the EOA. We still prepend the pre-call even if we can't confidently
+                // detect the version, because in local/devnet flows the stored fee payer is
+                // expected to be an IthacaAccount-compatible delegation.
+                if !self.is_ithaca_account(implementation, semver::Version::new(0, 5, 6)) {
+                    warn!(
+                        chain_id = %request.chain_id,
+                        fee_payer = %fee_payer,
+                        implementation = %implementation,
+                        "fee payer implementation version unknown/old; proceeding with stored pre-call + authorization"
+                    );
                 }
+
+                pre_calls.insert(0, account.pre_call.clone());
+                additional_authorization = Some((fee_payer, account.signed_authorization))
             }
         }
 

@@ -141,6 +141,8 @@ impl Chain {
         mock_from: Address,
         fee_token_balance: U256,
     ) -> Result<StateOverridesBuilder, RelayError> {
+        let fee_token_owner = intent.payer.unwrap_or(intent.eoa);
+
         // Add 1 wei worth of the fee token to ensure the user always has enough to pass the call
         // simulation
         let new_fee_token_balance = fee_token_balance.saturating_add(U256::from(1));
@@ -154,10 +156,19 @@ impl Chain {
                 intent.eoa,
                 AccountOverride::default()
                     // If the fee token is the native token, we override it
-                    .with_balance_opt(context.fee_token.is_zero().then_some(new_fee_token_balance))
+                    .with_balance_opt(
+                        (context.fee_token.is_zero() && fee_token_owner == intent.eoa)
+                            .then_some(new_fee_token_balance),
+                    )
                     // we manually fetch the 7702 designator since we do not have a signed auth item
                     .with_7702_delegation_designator_opt(context.stored_auth_address()),
             )
+            .append_opt(|| {
+                (context.fee_token.is_zero() && fee_token_owner != intent.eoa).then_some((
+                    fee_token_owner,
+                    AccountOverride::default().with_balance(new_fee_token_balance),
+                ))
+            })
             .extend(context.state_overrides.clone())
             .append_opt(|| {
                 context.additional_authorization.clone().map(|(addr, auth)| {
@@ -176,7 +187,7 @@ impl Chain {
                     .balance_overrides
                     .clone()
                     .modify_token(context.fee_token, |balance| {
-                        balance.add_balance(intent.eoa, new_fee_token_balance);
+                        balance.add_balance(fee_token_owner, new_fee_token_balance);
                     })
                     .into_state_overrides(self.provider())
                     .await?,
@@ -238,8 +249,10 @@ impl Chains {
                     desc.eth_send_raw_delegates.clone(),
                 )
                 .await?;
+                let aa_status_endpoint = desc.eth_send_raw_delegates.first().cloned();
                 let (service, handle) = TransactionService::new(
                     provider.clone(),
+                    aa_status_endpoint,
                     desc.flashblocks.as_ref(),
                     chain_signers.clone(),
                     storage.clone(),

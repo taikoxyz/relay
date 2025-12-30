@@ -1117,7 +1117,7 @@ impl StorageApi for PgStorage {
         .await
         .map_err(eyre::Error::from)?;
 
-        let mut result = HashMap::new();
+        let mut result: HashMap<ChainAddress, U256> = HashMap::default();
         for row in rows {
             result.insert(
                 (row.chain_id as u64, Address::from_slice(&row.asset_address)),
@@ -1139,7 +1139,7 @@ impl StorageApi for PgStorage {
         .await
         .map_err(eyre::Error::from)?;
 
-        let mut result = HashMap::new();
+        let mut result: HashMap<ChainAddress, U256> = HashMap::default();
         for row in rows {
             result.insert(
                 (row.chain_id as u64, Address::from_slice(&row.asset_address)),

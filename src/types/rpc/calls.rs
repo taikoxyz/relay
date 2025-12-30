@@ -367,7 +367,12 @@ impl PrepareCallsParameters {
             Ok(random_nonce)
         } else {
             let eoa = self.from.ok_or(IntentError::MissingSender)?;
-            Account::new(eoa, &provider).get_nonce().await.map_err(RelayError::from)
+            let account = Account::new(eoa, &provider);
+            if account.is_delegated().await? {
+                account.get_nonce().await.map_err(RelayError::from)
+            } else {
+                Ok(random_nonce)
+            }
         }
     }
 }

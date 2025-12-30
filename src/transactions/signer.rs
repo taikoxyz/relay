@@ -23,7 +23,7 @@ use alloy::{
     consensus::{Transaction, TxEip1559, TxEnvelope, TypedTransaction},
     eips::{BlockId, Encodable2718, eip1559::Eip1559Estimation},
     network::{Ethereum, EthereumWallet, NetworkWallet},
-    primitives::{Address, B256, Bytes, U256, uint},
+    primitives::{Address, B256, Bytes, FixedBytes, U256, fixed_bytes, uint},
     providers::{
         DynProvider, PendingTransactionError, Provider, utils::EIP1559_FEE_ESTIMATION_PAST_BLOCKS,
     },
@@ -39,6 +39,8 @@ use futures_util::{
 };
 use metrics::gauge;
 use opentelemetry::trace::{SpanKind, TraceContextExt};
+use serde::Deserialize;
+use serde_json::json;
 use std::{
     fmt::Display,
     pin::Pin,
@@ -53,6 +55,15 @@ use tokio::{sync::mpsc, task::JoinSet};
 use tracing::{Level, Span, debug, error, info, instrument, span, trace, warn};
 use tracing_futures::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+const ORCHESTRATOR_PRECALL_VERIFICATION_ERROR: FixedBytes<4> = fixed_bytes!("0x6ac5b32f");
+const AA_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const PULL_GAS_GAS_BUFFER: u64 = 10_000;
+const MIN_PULL_GAS_GAS_LIMIT: u64 = 35_000;
+
+fn should_skip_intent_simulation(revert_reason: FixedBytes<4>, has_authorization_list: bool) -> bool {
+    has_authorization_list && revert_reason == ORCHESTRATOR_PRECALL_VERIFICATION_ERROR
+}
 
 /// Lower bound of gas a signer should be able to afford before getting paused until being funded.
 pub const MIN_SIGNER_GAS: U256 = uint!(10_000_000_U256);
@@ -112,6 +123,28 @@ impl From<PendingTransactionError> for SignerError {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct JsonRpcError {
+    code: i64,
+    message: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AaIntentStatusResponse {
+    #[serde(default)]
+    transaction_hash: Option<B256>,
+    state: AaIntentState,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+enum AaIntentState {
+    Pending,
+    #[allow(dead_code)]
+    Included { block_number: u64, tx_hash: B256 },
+    Reverted { reason: String },
+    Dropped { reason: String },
+}
+
 /// Messages accepted by the [`Signer`].
 #[derive(Debug, Clone)]
 pub enum SignerMessage {
@@ -161,6 +194,10 @@ pub struct SignerInner {
     funder: Address,
     /// Fee settings for the network this signer supports.
     fees: FeeConfig,
+    /// Optional endpoint that supports `eth_getUserOperationByHash` (e.g. Gwyneth router).
+    aa_status_endpoint: Option<reqwest::Url>,
+    /// HTTP client used for AA status polling.
+    aa_status_http: reqwest::Client,
 }
 
 /// A signer responsible for signing and sending transactions on a _single_ network.
@@ -177,6 +214,7 @@ impl Signer {
         id: SignerId,
         provider: DynProvider,
         signer: DynSigner,
+        aa_status_endpoint: Option<reqwest::Url>,
         storage: RelayStorage,
         events_tx: mpsc::UnboundedSender<SignerEvent>,
         tx_metrics: Arc<TransactionServiceMetrics>,
@@ -229,6 +267,8 @@ impl Signer {
             monitor,
             funder,
             fees,
+            aa_status_endpoint,
+            aa_status_http: reqwest::Client::new(),
         };
         Ok(Self { inner: Arc::new(inner) })
     }
@@ -368,6 +408,8 @@ impl Signer {
         let is_polygon = Chain::from_id(self.chain_id).is_polygon();
         let mut attempt = 0;
         loop {
+            let has_authorization_list =
+                request.authorization_list.as_ref().is_some_and(|l| !l.is_empty());
             let result =
                 self.provider.call(request.clone()).await.map_err(SignerError::from).and_then(
                     |res| {
@@ -376,6 +418,21 @@ impl Signer {
                         }
                         let result = OrchestratorContract::executeCall::abi_decode_returns(&res)?;
                         if result != ORCHESTRATOR_NO_ERROR {
+                            // Some nodes do not yet apply EIP-7702 `authorization_list` during
+                            // `eth_call` / `debug_traceCall` style simulations. When that happens,
+                            // intents that rely on a pre-call upgrade path can "falsely" fail with
+                            // `PreCallVerificationError()`.
+                            //
+                            // If we have an authorization list (EIP-7702) and see this specific
+                            // error, skip simulation and broadcast anyway.
+                            if should_skip_intent_simulation(result, has_authorization_list) {
+                                warn!(
+                                    chain_id = self.chain_id,
+                                    tx_id = %tx.id,
+                                    "simulation returned PreCallVerificationError with authorization_list present; skipping simulation and broadcasting anyway"
+                                );
+                                return Ok(());
+                            }
                             return Err(SignerError::IntentRevert { revert_reason: result.into() });
                         }
                         Ok(())
@@ -432,6 +489,129 @@ impl Signer {
         Ok(())
     }
 
+    async fn try_watch_intent_via_aa_pool(
+        &self,
+        intent_tx_hash: B256,
+        timeout: Duration,
+    ) -> Result<Option<TransactionReceipt>, SignerError> {
+        let Some(url) = self.aa_status_endpoint.clone() else {
+            return Ok(None);
+        };
+
+        match self.watch_intent_via_aa_pool(&url, intent_tx_hash, timeout).await {
+            Ok(receipt) => Ok(Some(receipt)),
+            Err(SignerError::Other(err))
+                if err
+                    .to_string()
+                    .contains("eth_getUserOperationByHash not supported") =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn watch_intent_via_aa_pool(
+        &self,
+        url: &reqwest::Url,
+        intent_tx_hash: B256,
+        timeout: Duration,
+    ) -> Result<TransactionReceipt, SignerError> {
+        let start = Instant::now();
+        let mut remaining = timeout;
+
+        loop {
+            if remaining.is_zero() {
+                return Err(SignerError::TxTimeout);
+            }
+
+            let status = self.fetch_aa_intent_status(url, intent_tx_hash).await?;
+            match status {
+                None => {}
+                Some(status) => match status.state {
+                    AaIntentState::Pending => {}
+                    AaIntentState::Included { tx_hash, .. } => {
+                        let propose_hash = status.transaction_hash.unwrap_or(tx_hash);
+                        let receipt = self
+                            .monitor
+                            .watch_transaction(propose_hash, remaining)
+                            .await
+                            .ok_or(SignerError::TxTimeout)?;
+                        if receipt.status() {
+                            return Ok(receipt);
+                        }
+                        return Err(SignerError::Other(
+                            format!("propose transaction reverted: {propose_hash:#x}").into(),
+                        ));
+                    }
+                    AaIntentState::Reverted { reason } => {
+                        return Err(SignerError::Other(
+                            format!("intent reverted in AA pool: {reason}").into(),
+                        ));
+                    }
+                    AaIntentState::Dropped { reason } => {
+                        return Err(SignerError::Other(
+                            format!("intent dropped from AA pool: {reason}").into(),
+                        ));
+                    }
+                },
+            }
+
+            tokio::time::sleep(AA_STATUS_POLL_INTERVAL).await;
+            remaining = timeout.saturating_sub(start.elapsed());
+        }
+    }
+
+    async fn fetch_aa_intent_status(
+        &self,
+        url: &reqwest::Url,
+        intent_tx_hash: B256,
+    ) -> Result<Option<AaIntentStatusResponse>, SignerError> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_getUserOperationByHash",
+            "params": [format!("{intent_tx_hash:#x}")]
+        });
+
+        let resp = self
+            .aa_status_http
+            .post(url.clone())
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|err| SignerError::Other(Box::new(err)))?;
+
+        let value: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|err| SignerError::Other(Box::new(err)))?;
+
+        if let Some(error) = value.get("error") {
+            let parsed: JsonRpcError = serde_json::from_value(error.clone())
+                .map_err(|err| SignerError::Other(Box::new(err)))?;
+            if parsed.code == -32601 {
+                return Err(SignerError::Other(
+                    "eth_getUserOperationByHash not supported".to_string().into(),
+                ));
+            }
+            return Err(SignerError::Other(
+                format!("AA status rpc error {}: {}", parsed.code, parsed.message).into(),
+            ));
+        }
+
+        let Some(result) = value.get("result") else {
+            return Ok(None);
+        };
+        if result.is_null() {
+            return Ok(None);
+        }
+
+        let status: AaIntentStatusResponse = serde_json::from_value(result.clone())
+            .map_err(|err| SignerError::Other(Box::new(err)))?;
+        Ok(Some(status))
+    }
+
     /// Waits for a pending transaction to be confirmed.
     ///
     /// Receives a mutable reference to [`SentTransaction`] and might potentially modify it when
@@ -447,6 +627,17 @@ impl Signer {
             if last_sent_at.elapsed() >= self.config.transaction_timeout {
                 error!(?tx, "Transaction timed out");
                 return Err(SignerError::TxTimeout);
+            }
+
+            if tx.tx.is_intent()
+                && let Some(receipt) = self
+                    .try_watch_intent_via_aa_pool(
+                        *tx.best_tx().tx_hash(),
+                        self.config.transaction_timeout.saturating_sub(last_sent_at.elapsed()),
+                    )
+                    .await?
+            {
+                return Ok(receipt);
             }
 
             let mut handles = FuturesUnordered::new();
@@ -869,7 +1060,7 @@ impl Signer {
         )
         .await;
 
-        let latest_nonce = self.provider.get_transaction_count(self.address()).await?;
+        let latest_nonce = self.provider.get_transaction_count(self.address()).pending().await?;
         let gapped_nonces = (latest_nonce..*self.nonce.lock().await)
             .filter(|nonce| {
                 if !loaded_transactions.iter().any(|tx| tx.nonce() == *nonce) {
@@ -967,28 +1158,50 @@ impl Signer {
             .input(call.clone().into())
             .from(self.address());
 
-        let (balance, block_number, gas_limit) = try_join!(
+        let (funder_balance, signer_balance, block_number, gas_limit_estimate) = try_join!(
             async { self.provider.get_balance(self.funder).await },
+            async { self.provider.get_balance(self.address()).await },
             async { self.provider.get_block_number().await },
             async { self.provider.estimate_gas(tx).await }
         )?;
 
+        let gas_limit = gas_limit_estimate
+            .saturating_add(PULL_GAS_GAS_BUFFER)
+            .max(MIN_PULL_GAS_GAS_LIMIT);
+
         // determine if the pull gas transaction would fail, by checking balance against the tx
         // cost.
         let tx_cost = fees.max_fee_per_gas * gas_limit as u128;
-        if balance < tx_cost {
+        if signer_balance < tx_cost {
             warn!(
                 signer = %self.address(),
                 amount = %funding_amount,
                 chain_id = %self.chain_id,
-                %balance,
+                %signer_balance,
                 %tx_cost,
                 "Cannot call pullGas, signer balance is too low to pay for pullGas transaction"
             );
             return Ok(None);
         }
 
-        Ok(Some(PullGasContext { balance, block_number, gas_limit, funding_amount, call }))
+        debug!(
+            signer = %self.address(),
+            chain_id = %self.chain_id,
+            funder = %self.funder,
+            gas_limit_estimate,
+            gas_limit,
+            %funder_balance,
+            %signer_balance,
+            "pullGas gas limit buffered"
+        );
+
+        Ok(Some(PullGasContext {
+            balance: funder_balance,
+            block_number,
+            gas_limit,
+            funding_amount,
+            call,
+        }))
     }
 
     /// Initiates a pull gas transaction to top up the signer's balance using the funder. It will
@@ -1250,5 +1463,23 @@ impl Future for SignerTask {
         signer.metrics.poll_duration.record(instant.elapsed().as_nanos() as f64);
 
         Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skips_simulation_for_precall_verification_error_with_auth_list() {
+        assert!(should_skip_intent_simulation(
+            ORCHESTRATOR_PRECALL_VERIFICATION_ERROR,
+            true
+        ));
+        assert!(!should_skip_intent_simulation(
+            ORCHESTRATOR_PRECALL_VERIFICATION_ERROR,
+            false
+        ));
+        assert!(!should_skip_intent_simulation(fixed_bytes!("0xabab8fc9"), true));
     }
 }

@@ -1,10 +1,7 @@
 //! # Relay CLI
 use crate::{
     config::RelayConfig,
-    constants::{
-        DEFAULT_MAX_TRANSACTIONS, DEFAULT_RPC_DEFAULT_MAX_CONNECTIONS, INTENT_GAS_BUFFER,
-        TX_GAS_BUFFER,
-    },
+    constants::{DEFAULT_MAX_TRANSACTIONS, DEFAULT_RPC_DEFAULT_MAX_CONNECTIONS},
     spawn::try_spawn_with_args,
 };
 use alloy::{
@@ -73,20 +70,20 @@ pub struct Args {
     #[arg(long = "fee-recipient", value_name = "ADDRESS", default_value_t = Address::ZERO)]
     pub fee_recipient: Address,
     /// The lifetime of a fee quote.
-    #[arg(long, value_name = "SECONDS", value_parser = parse_duration_secs, default_value = "5")]
-    pub quote_ttl: Duration,
+    #[arg(long, value_name = "SECONDS", value_parser = parse_duration_secs)]
+    pub quote_ttl: Option<Duration>,
     /// The lifetime of a token price rate.
-    #[arg(long, value_name = "SECONDS", value_parser = parse_duration_secs, default_value = "300")]
-    pub rate_ttl: Duration,
+    #[arg(long, value_name = "SECONDS", value_parser = parse_duration_secs)]
+    pub rate_ttl: Option<Duration>,
     /// The constant rate for the price oracle. Used for testing.
     #[arg(long, value_name = "RATE")]
     pub constant_rate: Option<f64>,
     /// Extra buffer added to Intent gas estimates.
-    #[arg(long, value_name = "INTENT_GAS", default_value_t = INTENT_GAS_BUFFER)]
-    pub intent_gas_buffer: u64,
+    #[arg(long, value_name = "INTENT_GAS")]
+    pub intent_gas_buffer: Option<u64>,
     /// Extra buffer added to transaction gas estimates.
-    #[arg(long, value_name = "TX_OP_GAS", default_value_t = TX_GAS_BUFFER)]
-    pub tx_gas_buffer: u64,
+    #[arg(long, value_name = "TX_OP_GAS")]
+    pub tx_gas_buffer: Option<u64>,
     /// The database URL for the relay.
     #[arg(long = "database-url", value_name = "URL", env = "RELAY_DB_URL")]
     pub database_url: Option<String>,
@@ -149,7 +146,7 @@ impl Args {
 
     /// Merges [`Args`] values into an existing [`RelayConfig`] instance.
     pub fn merge_relay_config(self, config: RelayConfig) -> RelayConfig {
-        config
+        let mut config = config
             .with_signers_mnemonic(self.signers_mnemonic)
             .with_public_node_endpoints(self.public_node_endpoints.clone())
             .with_fee_recipient(self.fee_recipient)
@@ -157,8 +154,6 @@ impl Args {
             .with_port(self.port)
             .with_metrics_port(self.metrics_port)
             .with_max_connections(self.max_connections)
-            .with_quote_ttl(self.quote_ttl)
-            .with_rate_ttl(self.rate_ttl)
             .with_quote_constant_rate(self.constant_rate)
             .with_orchestrator(self.orchestrator)
             .with_delegation_proxy(self.delegation_proxy)
@@ -167,14 +162,27 @@ impl Args {
             .with_funder(self.funder)
             .with_escrow(self.escrow)
             .with_funder_key(self.funder_key)
-            .with_intent_gas_buffer(self.intent_gas_buffer)
-            .with_tx_gas_buffer(self.tx_gas_buffer)
             .with_database_url(self.database_url)
             .with_max_pending_transactions(self.max_pending_transactions)
             .with_resend_api_key(self.resend_api_key)
             .with_porto_base_url(self.porto_base_url)
             .with_binance_keys(self.binance_api_key, self.binance_api_secret)
-            .with_funder_owner_key(self.funder_owner_key)
+            .with_funder_owner_key(self.funder_owner_key);
+
+        if let Some(quote_ttl) = self.quote_ttl {
+            config = config.with_quote_ttl(quote_ttl);
+        }
+        if let Some(rate_ttl) = self.rate_ttl {
+            config = config.with_rate_ttl(rate_ttl);
+        }
+        if let Some(intent_gas_buffer) = self.intent_gas_buffer {
+            config = config.with_intent_gas_buffer(intent_gas_buffer);
+        }
+        if let Some(tx_gas_buffer) = self.tx_gas_buffer {
+            config = config.with_tx_gas_buffer(tx_gas_buffer);
+        }
+
+        config
     }
 }
 

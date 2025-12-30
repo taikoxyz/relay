@@ -158,6 +158,7 @@ impl TransactionService {
     /// This also spawns dedicated [`Signer`] task for each configured signer.
     pub async fn new(
         provider: DynProvider,
+        aa_status_endpoint: Option<Url>,
         flashblocks_rpc_endpoint: Option<&Url>,
         signers: Vec<DynSigner>,
         storage: RelayStorage,
@@ -199,7 +200,14 @@ impl TransactionService {
 
         // create all the signers
         for signer in signers {
-            this.create_signer(signer, provider.clone(), monitor.clone(), funder, fees.clone())
+            this.create_signer(
+                signer,
+                provider.clone(),
+                aa_status_endpoint.clone(),
+                monitor.clone(),
+                funder,
+                fees.clone(),
+            )
                 .await?;
         }
 
@@ -219,6 +227,7 @@ impl TransactionService {
         &mut self,
         signer: DynSigner,
         provider: DynProvider,
+        aa_status_endpoint: Option<Url>,
         monitor: TransactionMonitoringHandle,
         funder: Address,
         fees: FeeConfig,
@@ -231,6 +240,7 @@ impl TransactionService {
             signer_id,
             provider,
             signer,
+            aa_status_endpoint,
             self.storage.clone(),
             events_tx,
             metrics,

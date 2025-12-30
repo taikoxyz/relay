@@ -626,6 +626,7 @@ async fn restart_with_pending() -> eyre::Result<()> {
     let (service, _handle) = TransactionService::new(
         provider.clone(),
         None,
+        None,
         signers,
         storage.clone(),
         config.transaction_service_config.clone(),
