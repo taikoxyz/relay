@@ -465,12 +465,17 @@ impl Signer {
     /// Broadcasts a given transaction.
     #[instrument(skip_all, fields(signer = %self.address(), chain_id = %self.chain_id))]
     async fn send_transaction(&self, tx: &TxEnvelope) -> Result<(), SignerError> {
+        debug!(
+            tx_hash = %tx.hash(),
+            nonce = %tx.nonce(),
+            "Broadcasting raw transaction"
+        );
         let _ = self
             .provider
             .send_raw_transaction(&tx.encoded_2718())
             .await
             .inspect(|_| {
-                trace!(
+                debug!(
                     tx_hash = %tx.hash(),
                     nonce = %tx.nonce(),
                     "Sent transaction"
@@ -498,6 +503,11 @@ impl Signer {
             return Ok(None);
         };
 
+        debug!(
+            %intent_tx_hash,
+            aa_status_endpoint = %url,
+            "Watching intent via AA pool"
+        );
         match self.watch_intent_via_aa_pool(&url, intent_tx_hash, timeout).await {
             Ok(receipt) => Ok(Some(receipt)),
             Err(SignerError::Other(err))
@@ -527,10 +537,25 @@ impl Signer {
 
             let status = self.fetch_aa_intent_status(url, intent_tx_hash).await?;
             match status {
-                None => {}
+                None => {
+                    debug!(
+                        %intent_tx_hash,
+                        "AA pool status not found yet"
+                    );
+                }
                 Some(status) => match status.state {
-                    AaIntentState::Pending => {}
+                    AaIntentState::Pending => {
+                        debug!(
+                            %intent_tx_hash,
+                            "AA pool status pending"
+                        );
+                    }
                     AaIntentState::Included { tx_hash, .. } => {
+                        debug!(
+                            %intent_tx_hash,
+                            propose_hash = %status.transaction_hash.unwrap_or(tx_hash),
+                            "AA pool status included"
+                        );
                         let propose_hash = status.transaction_hash.unwrap_or(tx_hash);
                         let receipt = self
                             .monitor
@@ -545,11 +570,21 @@ impl Signer {
                         ));
                     }
                     AaIntentState::Reverted { reason } => {
+                        debug!(
+                            %intent_tx_hash,
+                            %reason,
+                            "AA pool status reverted"
+                        );
                         return Err(SignerError::Other(
                             format!("intent reverted in AA pool: {reason}").into(),
                         ));
                     }
                     AaIntentState::Dropped { reason } => {
+                        debug!(
+                            %intent_tx_hash,
+                            %reason,
+                            "AA pool status dropped"
+                        );
                         return Err(SignerError::Other(
                             format!("intent dropped from AA pool: {reason}").into(),
                         ));
@@ -896,6 +931,15 @@ impl Signer {
                     ?min_balance,
                     "signer balance is too low, pausing"
                 );
+                warn!(
+                    signer = %self.address(),
+                    chain_id = %self.chain_id,
+                    ?balance,
+                    ?min_balance,
+                    max_fee_per_gas = ?fees.max_fee_per_gas,
+                    max_priority_fee_per_gas = ?fees.max_priority_fee_per_gas,
+                    "signer below min balance, attempting pullGas"
+                );
                 self.emit_event(SignerEvent::PauseSigner(self.id()));
                 self.paused.store(true, Ordering::Relaxed);
 
@@ -904,6 +948,10 @@ impl Signer {
                         signer = %self.address(),
                         chain_id = %self.chain_id,
                         funder = %self.funder,
+                        ?balance,
+                        ?min_balance,
+                        max_fee_per_gas = ?fees.max_fee_per_gas,
+                        max_priority_fee_per_gas = ?fees.max_priority_fee_per_gas,
                         ?err,
                         "Failed to create pull gas context"
                     );
@@ -1158,12 +1206,25 @@ impl Signer {
             .input(call.clone().into())
             .from(self.address());
 
-        let (funder_balance, signer_balance, block_number, gas_limit_estimate) = try_join!(
-            async { self.provider.get_balance(self.funder).await },
-            async { self.provider.get_balance(self.address()).await },
-            async { self.provider.get_block_number().await },
-            async { self.provider.estimate_gas(tx).await }
-        )?;
+        let funder_balance = self.provider.get_balance(self.funder).await?;
+        let signer_balance = self.provider.get_balance(self.address()).await?;
+        let block_number = self.provider.get_block_number().await?;
+        let gas_limit_estimate = match self.provider.estimate_gas(tx).await {
+            Ok(value) => value,
+            Err(err) => {
+                error!(
+                    signer = %self.address(),
+                    chain_id = %self.chain_id,
+                    funder = %self.funder,
+                    amount = %funding_amount,
+                    max_fee_per_gas = fees.max_fee_per_gas,
+                    %funder_balance,
+                    %signer_balance,
+                    "pullGas estimate_gas failed"
+                );
+                return Err(SignerError::Rpc(err));
+            }
+        };
 
         let gas_limit = gas_limit_estimate
             .saturating_add(PULL_GAS_GAS_BUFFER)

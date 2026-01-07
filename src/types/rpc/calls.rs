@@ -632,6 +632,9 @@ pub struct SendPreparedCallsParameters {
 pub struct SendPreparedCallsResponse {
     /// Bundle ID.
     pub id: BundleId,
+    /// The AA pool intent hash, if available.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "intentHash")]
+    pub intent_hash: Option<B256>,
 }
 
 /// The status code of a call bundle.

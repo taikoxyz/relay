@@ -52,7 +52,7 @@ use jsonrpsee::{
     proc_macros::rpc,
 };
 use opentelemetry::trace::SpanKind;
-use std::{cmp, collections::HashMap, sync::Arc, time::SystemTime};
+use std::{cmp, collections::HashMap, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
 use tokio::try_join;
 use tracing::{Instrument, Level, debug, error, info, instrument, span, warn};
 
@@ -661,10 +661,27 @@ impl Relay {
         quotes: SignedQuotes,
         capabilities: SendPreparedCallsCapabilities,
         signature: Bytes,
-    ) -> RpcResult<BundleId> {
+    ) -> RpcResult<(BundleId, Option<B256>)> {
         // if we do **not** get an error here, then the quote ttl must be in the past, which means
         // it is expired
-        if SystemTime::now().duration_since(quotes.ty().ttl).is_ok() {
+        let now = SystemTime::now();
+        if let Ok(elapsed) = now.duration_since(quotes.ty().ttl) {
+            let now_secs = now
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let ttl_secs = quotes
+                .ty()
+                .ttl
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            warn!(
+                now_secs,
+                ttl_secs,
+                expired_by_secs = elapsed.as_secs(),
+                "quote expired",
+            );
             return Err(QuoteError::QuoteExpired.into());
         }
 
@@ -1864,13 +1881,30 @@ impl Relay {
                 all_quotes.push(output_quote);
                 all_asset_diffs.push(request.chain_id, output_asset_diffs);
 
+                let now = SystemTime::now();
+                let ttl = now
+                    .checked_add(self.inner.quote_config.ttl)
+                    .expect("should never overflow");
+                let now_secs = now
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let ttl_secs = ttl
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                debug!(
+                    now_secs,
+                    ttl_secs,
+                    ttl_delta_secs = self.inner.quote_config.ttl.as_secs(),
+                    "quote ttl computed (multichain)"
+                );
+
                 return Ok((
                     all_asset_diffs,
                     Quotes {
                         quotes: all_quotes,
-                        ttl: SystemTime::now()
-                            .checked_add(self.inner.quote_config.ttl)
-                            .expect("should never overflow"),
+                        ttl,
                         // todo(onbjerg): a little silly that we have to set this to `None`, then
                         // call `with_merke_payload`. we should consider
                         // smth like Quotes::new(quotes, ttl).with_merkle_payload(..) or
@@ -1943,13 +1977,30 @@ impl Relay {
             )
             .await?;
 
+        let now = SystemTime::now();
+        let ttl = now
+            .checked_add(self.inner.quote_config.ttl)
+            .expect("should never overflow");
+        let now_secs = now
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let ttl_secs = ttl
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        debug!(
+            now_secs,
+            ttl_secs,
+            ttl_delta_secs = self.inner.quote_config.ttl.as_secs(),
+            "quote ttl computed (single)"
+        );
+
         Ok((
             AssetDiffResponse::new(request.chain_id, asset_diffs),
             Quotes {
                 quotes: vec![quote],
-                ttl: SystemTime::now()
-                    .checked_add(self.inner.quote_config.ttl)
-                    .expect("should never overflow"),
+                ttl,
                 multi_chain_root: None,
             },
         ))
@@ -1962,7 +2013,7 @@ impl Relay {
         capabilities: SendPreparedCallsCapabilities,
         signature: Bytes,
         bundle_id: BundleId,
-    ) -> RpcResult<BundleId> {
+    ) -> RpcResult<(BundleId, Option<B256>)> {
         // send intent
         let tx = self
             .prepare_tx(
@@ -1983,7 +2034,7 @@ impl Relay {
             messaging.operation.type = "send",
             messaging.message.id = %tx.id
         );
-        self.inner
+        let mut status_rx = self.inner
             .chains
             .ensure_chain(tx.chain_id())?
             .transactions()
@@ -1991,7 +2042,22 @@ impl Relay {
             .instrument(span)
             .await?;
 
-        Ok(bundle_id)
+        // Best-effort: wait briefly for the tx hash so callers can query AA pool status.
+        let intent_hash = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match status_rx.recv().await {
+                    Ok(TransactionStatus::Pending(hash)) => return Some(hash),
+                    Ok(TransactionStatus::Confirmed(receipt)) => return Some(receipt.transaction_hash),
+                    Ok(TransactionStatus::Failed(_)) => return None,
+                    Ok(TransactionStatus::InFlight) => continue,
+                    Err(_) => return None,
+                }
+            }
+        })
+        .await
+        .unwrap_or(None);
+
+        Ok((bundle_id, intent_hash))
     }
 
     /// Handle multichain send intents
@@ -2001,14 +2067,14 @@ impl Relay {
         capabilities: SendPreparedCallsCapabilities,
         signature: Bytes,
         bundle_id: BundleId,
-    ) -> RpcResult<BundleId> {
+    ) -> RpcResult<(BundleId, Option<B256>)> {
         let bundle =
             self.create_interop_bundle(bundle_id, &mut quotes, &capabilities, signature).await?;
 
         let interop = self.inner.chains.interop().ok_or(QuoteError::MultichainDisabled)?;
         interop.send_bundle(bundle).await?;
 
-        Ok(bundle_id)
+        Ok((bundle_id, None))
     }
 
     /// Creates a [`InteropBundle`] from signed quotes for multichain transactions.
@@ -2324,7 +2390,7 @@ impl RelayApiServer for Relay {
         let signature = intent_key.wrap_signature(signature);
 
         // broadcasts intents in transactions
-        let id = match context {
+        let (id, intent_hash) = match context {
             PrepareCallsContext::Quote(quotes) => {
                 self.send_intents(*quotes, capabilities, signature).await.inspect_err(|err| {
                     error!(
@@ -2388,11 +2454,11 @@ impl RelayApiServer for Relay {
                 call.signature = signature;
                 self.inner.storage.store_precall(chain_id, call).await?;
 
-                Default::default()
+                (Default::default(), None)
             }
         };
 
-        Ok(SendPreparedCallsResponse { id })
+        Ok(SendPreparedCallsResponse { id, intent_hash })
     }
 
     async fn upgrade_account(&self, request: UpgradeAccountParameters) -> RpcResult<()> {
