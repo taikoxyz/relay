@@ -721,38 +721,72 @@ impl Signer {
     async fn watch_transaction(&self, mut tx: PendingTransaction) -> Result<(), SignerError> {
         Span::current().add_link(tx.tx.trace_context.span().span_context().clone());
 
-        // todo: set parent span to context in pendingtx
         self.metrics.pending.increment(1);
-        match self.watch_transaction_inner(&mut tx).await {
-            Ok(receipt) => {
-                self.on_confirmed_transaction(tx, receipt).await?;
-            }
-            Err(err) => {
-                error!(%err, "failed to wait for transaction confirmation, closing nonce gap");
 
-                // If we've failed to send the transaction, start closing the nonce gap to make sure
-                // we occupy the chosen nonce.
-                self.close_nonce_gap(tx.nonce(), Some(tx.fees())).await;
-
-                // After making sure that the nonce is occupied, check if it was occupied by one of
-                // the transactions sent before.
-                for sent in &tx.sent {
-                    if let Ok(Some(receipt)) =
-                        self.provider.get_transaction_receipt(*sent.tx_hash()).await
-                        && receipt.block_number.is_some()
-                    {
-                        self.on_confirmed_transaction(tx, receipt).await?;
-                        return Ok(());
-                    }
+        loop {
+            match self.watch_transaction_inner(&mut tx).await {
+                Ok(receipt) => {
+                    self.on_confirmed_transaction(tx, receipt).await?;
+                    return Ok(());
                 }
+                Err(err) => {
+                    // In AA-pool mode, intents can legitimately take longer than normal
+                    // txpool-based confirmation heuristics. Additionally, when the signer nonce is
+                    // behind the intent nonce, the intent can never be included until earlier
+                    // nonces are occupied. In that case, attempt to close the missing nonces
+                    // before continuing to watch the original intent.
+                    if tx.tx.is_intent() && matches!(err, SignerError::TxTimeout) {
+                        if let Ok(chain_nonce) = self
+                            .provider
+                            .get_transaction_count(self.address())
+                            .pending()
+                            .await
+                        {
+                            let tx_nonce = tx.nonce();
+                            if chain_nonce < tx_nonce {
+                                warn!(
+                                    signer = %self.address(),
+                                    chain_id = %self.chain_id,
+                                    chain_nonce,
+                                    tx_nonce,
+                                    "intent timed out but signer nonce is behind; closing missing nonces before retrying"
+                                );
+                                for missing in chain_nonce..tx_nonce {
+                                    self.close_nonce_gap(missing, None).await;
+                                }
+                            }
+                        }
 
-                // None of the sent transactions confirmed, mark transaction as failed.
-                self.metrics.pending.decrement(1);
-                self.on_failed_transaction(tx.id(), err).await?;
+                        // Keep watching the original intent; do not consume its nonce via a dummy
+                        // replacement transaction.
+                        continue;
+                    }
+
+                    error!(%err, "failed to wait for transaction confirmation, closing nonce gap");
+
+                    // If we've failed to send the transaction, start closing the nonce gap to make sure
+                    // we occupy the chosen nonce.
+                    self.close_nonce_gap(tx.nonce(), Some(tx.fees())).await;
+
+                    // After making sure that the nonce is occupied, check if it was occupied by one of
+                    // the transactions sent before.
+                    for sent in &tx.sent {
+                        if let Ok(Some(receipt)) =
+                            self.provider.get_transaction_receipt(*sent.tx_hash()).await
+                            && receipt.block_number.is_some()
+                        {
+                            self.on_confirmed_transaction(tx, receipt).await?;
+                            return Ok(());
+                        }
+                    }
+
+                    // None of the sent transactions confirmed, mark transaction as failed.
+                    self.metrics.pending.decrement(1);
+                    self.on_failed_transaction(tx.id(), err).await?;
+                    return Ok(());
+                }
             }
         }
-
-        Ok(())
     }
 
     /// Broadcasts a given transaction and waits for it to be confirmed, notifying `status_tx` on
@@ -883,7 +917,18 @@ impl Signer {
 
             let tx_hash = *tx.tx_hash();
             debug!(%tx_hash, "Sending nonce gap closing transaction");
-            self.send_transaction(&tx).await.map_err(|e| (e, tx_hash))?;
+            match self.provider.send_raw_transaction(&tx.encoded_2718()).await {
+                Ok(_) => {}
+                Err(err) if err.is_already_known() => {
+                    debug!(%tx_hash, "nonce gap closing transaction already known; waiting")
+                }
+                Err(err) if err.is_nonce_too_low() => {
+                    // The nonce was already consumed; treat this as "closed" and let the caller
+                    // re-check on-chain nonce progress.
+                    return Ok(());
+                }
+                Err(err) => return Err((SignerError::Other(Box::new(err)), tx_hash)),
+            }
             // Give transaction 10 blocks to be mined.
             if self.monitor.watch_transaction(tx_hash, self.block_time * 10).await.is_none() {
                 return Err((SignerError::TxTimeout, tx_hash));
