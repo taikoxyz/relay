@@ -140,6 +140,8 @@ struct AaIntentStatusResponse {
 enum AaIntentState {
     Pending,
     #[allow(dead_code)]
+    InFlight { submitted_at: u64 },
+    #[allow(dead_code)]
     Included { block_number: u64, tx_hash: B256 },
     Reverted { reason: String },
     Dropped { reason: String },
@@ -548,6 +550,13 @@ impl Signer {
                         debug!(
                             %intent_tx_hash,
                             "AA pool status pending"
+                        );
+                    }
+                    AaIntentState::InFlight { submitted_at } => {
+                        debug!(
+                            %intent_tx_hash,
+                            submitted_at,
+                            "AA pool status in-flight"
                         );
                     }
                     AaIntentState::Included { tx_hash, .. } => {
